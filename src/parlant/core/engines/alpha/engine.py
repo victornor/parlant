@@ -1921,8 +1921,8 @@ class AlphaEngine(Engine):
             ).get("journey_id"):
                 journey_id = cast(JourneyId, journey_id)
 
-                if journey_id in journeys:
-                    journeys.remove(journey_id)
+                # if journey_id in journeys:
+                journeys.remove(journey_id)
 
                 if "journey_path" not in match.metadata:
                     self._logger.error(

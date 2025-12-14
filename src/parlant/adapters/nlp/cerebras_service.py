@@ -56,6 +56,17 @@ class LlamaEstimatingTokenizer(EstimatingTokenizer):
         return len(tokens) + 36
 
 
+class QwenEstimatingTokenizer(EstimatingTokenizer):
+    def __init__(self) -> None:
+        # Qwen uses similar tokenization to GPT-4
+        self.encoding = tiktoken.encoding_for_model("gpt-4o-2024-08-06")
+
+    @override
+    async def estimate_token_count(self, prompt: str) -> int:
+        tokens = self.encoding.encode(prompt)
+        return len(tokens)  # Qwen doesn't need the +36 adjustment
+
+
 class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
     supported_hints = ["temperature"]
 
@@ -63,10 +74,11 @@ class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
         self,
         model_name: str,
         logger: Logger,
+        tracer: Tracer,
         meter: Meter,
     ) -> None:
-        self.model_name = model_name
-
+        super().__init__(logger=logger, tracer=tracer, meter=meter, model_name=model_name)
+        
         self._logger = logger
         self._meter = meter
         self._client = AsyncCerebras(api_key=os.environ.get("CEREBRAS_API_KEY"))
@@ -147,6 +159,7 @@ class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
             await record_llm_metrics(
                 self._meter,
                 self.model_name,
+                schema_name=self.schema.__name__,
                 input_tokens=response.usage.prompt_tokens,  # type: ignore
                 output_tokens=response.usage.completion_tokens,  # type: ignore
             )
@@ -172,10 +185,11 @@ class CerebrasSchematicGenerator(BaseSchematicGenerator[T]):
 
 
 class Llama3_3_8B(CerebrasSchematicGenerator[T]):
-    def __init__(self, logger: Logger, meter: Meter) -> None:
+    def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(
             model_name="llama3.1-8b",
             logger=logger,
+            tracer=tracer,
             meter=meter,
         )
         self._estimating_tokenizer = LlamaEstimatingTokenizer()
@@ -197,10 +211,11 @@ class Llama3_3_8B(CerebrasSchematicGenerator[T]):
 
 
 class Llama3_3_70B(CerebrasSchematicGenerator[T]):
-    def __init__(self, logger: Logger, meter: Meter) -> None:
+    def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
         super().__init__(
             model_name="llama3.3-70b",
             logger=logger,
+            tracer=tracer,
             meter=meter,
         )
 
@@ -220,6 +235,33 @@ class Llama3_3_70B(CerebrasSchematicGenerator[T]):
     @override
     def max_tokens(self) -> int:
         return 32 * 1024
+
+
+class Qwen3_235B(CerebrasSchematicGenerator[T]):
+    def __init__(self, logger: Logger, tracer: Tracer, meter: Meter) -> None:
+        super().__init__(
+            model_name="qwen-3-235b-a22b-instruct-2507",
+            logger=logger,
+            tracer=tracer,
+            meter=meter,
+        )
+
+        self._estimating_tokenizer = QwenEstimatingTokenizer()
+
+    @property
+    @override
+    def id(self) -> str:
+        return self.model_name
+
+    @property
+    @override
+    def tokenizer(self) -> QwenEstimatingTokenizer:
+        return self._estimating_tokenizer
+
+    @property
+    @override
+    def max_tokens(self) -> int:
+        return 32 * 1024  # 32K context window
 
 
 class CerebrasService(NLPService):
@@ -244,13 +286,68 @@ Please set CEREBRAS_API_KEY in your environment before running Parlant.
         self._logger = logger
         self._tracer = tracer
         self._meter = meter
-        self._logger.info("Initialized CerebrasService")
+        
+        # Get model name from environment variable
+        self.model_name = os.environ.get("CEREBRAS_MODEL", "llama3.3-70b")
+        
+        self._logger.info(f"Initialized CerebrasService with model: {self.model_name}")
+
+    def _get_generator_class(
+        self,
+        model_name: str,
+        t: type[T],
+    ) -> CerebrasSchematicGenerator[T]:
+        """Returns the appropriate generator class for the specified model."""
+        
+        # Model mapping for known models
+        if model_name == "llama3.1-8b":
+            return Llama3_3_8B[t](self._logger, self._tracer, self._meter)  # type: ignore
+        elif model_name == "llama3.3-70b":
+            return Llama3_3_70B[t](self._logger, self._tracer, self._meter)  # type: ignore
+        elif model_name == "qwen-3-235b-a22b-instruct-2507":
+            return Qwen3_235B[t](self._logger, self._tracer, self._meter)  # type: ignore
+        else:
+            # Create dynamic generator for unknown models
+            # Use sensible defaults based on model family
+            if "qwen" in model_name.lower():
+                tokenizer_class = QwenEstimatingTokenizer
+                max_tokens = 32 * 1024
+            else:
+                tokenizer_class = LlamaEstimatingTokenizer
+                max_tokens = 32 * 1024
+            
+            # Capture variables in closure
+            final_tokenizer = tokenizer_class()
+            final_max_tokens = max_tokens
+            
+            # Create dynamic class
+            class DynamicCerebrasGenerator(CerebrasSchematicGenerator[T]):
+                def __init__(self, logger: Logger, tracer: Tracer, meter: Meter):
+                    super().__init__(model_name=model_name, logger=logger, tracer=tracer, meter=meter)
+                    self._estimating_tokenizer = final_tokenizer
+                
+                @property
+                @override
+                def id(self) -> str:
+                    return model_name
+                
+                @property
+                @override
+                def tokenizer(self) -> EstimatingTokenizer:
+                    return self._estimating_tokenizer
+                
+                @property
+                @override
+                def max_tokens(self) -> int:
+                    return final_max_tokens
+            
+            return DynamicCerebrasGenerator[t](self._logger, self._tracer, self._meter)  # type: ignore
 
     @override
     async def get_schematic_generator(
         self, t: type[T], hints: SchematicGeneratorHints = {}
     ) -> CerebrasSchematicGenerator[T]:
-        return Llama3_3_70B[t](self._logger, self._tracer, self._meter)  # type: ignore
+        return self._get_generator_class(self.model_name, t)
 
     @override
     async def get_embedder(self, hints: EmbedderHints = {}) -> Embedder:
