@@ -1920,7 +1920,9 @@ class AlphaEngine(Engine):
                 dict[str, JSONSerializable], match.guideline.metadata.get("journey_node", {})
             ).get("journey_id"):
                 journey_id = cast(JourneyId, journey_id)
-                journeys.remove(journey_id)
+
+                if journey_id in journeys:
+                    journeys.remove(journey_id)
 
                 if "journey_path" not in match.metadata:
                     self._logger.error(
